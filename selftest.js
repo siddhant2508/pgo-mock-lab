@@ -1,0 +1,51 @@
+// End-to-end check against a running local site:  npm start   (in one window)   npm test   (in another)
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // the local certificate is self-signed
+const cfg = require('../server/config'), fs = require('fs');
+const base = `${fs.existsSync(cfg.TLS_CERT) ? 'https' : 'http'}://localhost:${cfg.PORT}`;
+let pass = 0, failN = 0; const ok = (c, m) => { c ? pass++ : failN++; console.log(`${c ? 'PASS' : 'FAIL'}  ${m}`); };
+function client() { let cookie = ''; return async (method, p, body, headers = {}) => { const r = await fetch(base + p, { method, headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'pgo', cookie, ...headers }, body: body ? JSON.stringify(body) : undefined }); const sc = r.headers.get('set-cookie'); if (sc) cookie = sc.split(';')[0]; return { status: r.status, data: await r.json().catch(() => ({})) }; }; }
+(async () => {
+  const email = `selftest+${Date.now()}@example.com`, a = client(), b = client();
+  ok((await a('GET', '/api/me')).status === 401, 'signed-out visitors cannot read account data');
+  ok((await a('POST', '/api/auth/request', { email: 'not-an-email' })).status === 400, 'bad email is rejected');
+  let r = await a('POST', '/api/auth/request', { email }); const code = r.data.devCode;
+  ok(r.status === 200 && /^\d{6}$/.test(code || ''), 'login code issued (shown only because DEV_MODE is on)');
+  ok((await a('POST', '/api/auth/verify', { email, code: code === '000000' ? '111111' : '000000' })).status === 400, 'wrong code is rejected');
+  ok((await a('POST', '/api/auth/verify', { email, code })).status === 200, 'right code signs in');
+  await a('POST', '/api/profile', { name: 'Self Test' });
+  r = await a('GET', '/api/me'); ok(r.data.tests.length === 11 && r.data.tests.filter(t => t.owned).length === 1, 'new account owns only the free demo');
+  ok((await a('POST', '/api/attempts', { testId: 'm1' })).status === 403, 'a paid mock cannot be started before buying');
+  ok((await fetch(base + '/api/attempts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status === 403, 'requests without the app header are refused (CSRF guard)');
+  r = await a('POST', '/api/attempts', { testId: 'demo' }); const id = r.data.attemptId;
+  r = await a('GET', `/api/attempts/${id}/q/0`);
+  ok(r.status === 200 && r.data.options.length === 4 && !('a' in r.data) && !JSON.stringify(r.data).includes('"e"'), 'a question arrives without its answer');
+  ok((await a('GET', `/api/attempts/${id}/result`)).status === 409, 'answers are withheld until the test is submitted');
+  for (let i = 0; i < 15; i++) await a('POST', `/api/attempts/${id}/answer`, { n: i, chosen: i % 4, seconds: 5 });
+  ok((await a('POST', `/api/attempts/${id}/answer`, { n: 99, chosen: 1 })).status === 400, 'out-of-range answers are rejected');
+  await a('POST', `/api/attempts/${id}/submit`);
+  r = await a('GET', `/api/attempts/${id}/result`);
+  const mine = r.data.rows.filter(x => x.ua === x.a).length;
+  ok(r.status === 200 && r.data.score === mine && r.data.rows.length === 15, `demo scored on the server (${r.data.score}/15) and matches the answer review`);
+  ok((await a('POST', `/api/attempts/${id}/answer`, { n: 0, chosen: 1 })).status === 409, 'answers cannot be changed after submitting');
+  r = await a('POST', '/api/checkout', { item: 'm2' }); ok(r.data.mode === 'dev' && r.data.amount === cfg.PRICE_SINGLE_PAISE, 'single mock priced on the server');
+  r = await a('GET', '/api/me'); ok(r.data.pricing.packNow === cfg.PRICE_PACK_PAISE - cfg.PRICE_SINGLE_PAISE, 'upgrade price = pack minus what was paid');
+  r = await a('POST', '/api/checkout', { item: 'pack' }); ok(r.data.amount === cfg.PRICE_PACK_PAISE - cfg.PRICE_SINGLE_PAISE, 'upgrade charged at the difference');
+  r = await a('GET', '/api/me'); ok(r.data.tests.every(t => t.owned), 'all mocks unlocked after the pack');
+  ok((await a('POST', '/api/checkout', { item: 'pack' })).status === 400, 'cannot buy what is already owned');
+  r = await a('POST', '/api/attempts', { testId: 'm1' }); ok(r.status === 200, 'owned mock starts');
+  const other = (await a('GET', `/api/attempts/${r.data.attemptId}`)).data; ok(other.n === 100 && other.subjectOf.length === 100, 'full mock has 100 questions');
+  r = await b('POST', '/api/auth/request', { email }); await b('POST', '/api/auth/verify', { email, code: r.data.devCode });
+  ok((await a('GET', '/api/me')).status === 200 && (await b('GET', '/api/me')).data.devices === 2, 'one account works on two devices at once');
+  const d3 = client(); r = await d3('POST', '/api/auth/request', { email }); await d3('POST', '/api/auth/verify', { email, code: r.data.devCode });
+  ok((await a('GET', '/api/me')).status === 401 && (await b('GET', '/api/me')).status === 200 && (await d3('GET', '/api/me')).status === 200, 'a third device signs out the oldest one');
+  ok((await b('GET', `/api/attempts/${id}/result`)).status === 200, 'results stay with the account');
+  const c = client(), e2 = `other+${Date.now()}@example.com`; r = await c('POST', '/api/auth/request', { email: e2 }); await c('POST', '/api/auth/verify', { email: e2, code: r.data.devCode });
+  ok((await c('GET', `/api/attempts/${id}/result`)).status === 404, "one student cannot open another student's result");
+  ok((await c('GET', '/api/admin/overview')).status === 403, 'admin pages are closed to students');
+  await new Promise(x => setTimeout(x, 400));
+  const raw = fs.readFileSync(cfg.DB_FILE), bank = fs.readFileSync(cfg.BANK_FILE);
+  ok(!raw.includes(Buffer.from('example.com')) && raw.subarray(0, 4).toString() === 'PGO1', 'student data on disk is encrypted');
+  ok(!bank.includes(Buffer.from('Anatomy')), 'question bank on disk is encrypted');
+  const page = await fetch(base + '/'); ok(/frame-ancestors 'none'/.test(page.headers.get('content-security-policy') || ''), 'security headers are set');
+  console.log(`\n${pass} passed, ${failN} failed`); process.exit(failN ? 1 : 0);
+})().catch(e => { console.error('Could not reach the site. Is "npm start" running?\n', e.message); process.exit(1); });

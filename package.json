@@ -1,0 +1,13 @@
+{
+  "name": "pgo-mock-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PGO-CET mock test website: email-code login, server-side tests, scorecards, Razorpay payments. Encrypted storage, HTTPS.",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "setup": "node scripts/setup.js",
+    "start": "node server/index.js",
+    "test": "node scripts/selftest.js",
+    "rotate-key": "node scripts/rotate-key.js"
+  }
+}
